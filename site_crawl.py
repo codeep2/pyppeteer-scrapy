@@ -1,116 +1,145 @@
 import asyncio
-import time
+import random
+from pyppeteer import launcher
+from json import dumps
+from pandas import Series, DataFrame
 
-import pyppeteer
-from pyppeteer import launch
-from lxml import etree
-import tldextract
+class Spider():
+    def __init__(self, Config):
+        self.crawl_list = []          # 待爬取列表
+        self.crawled_list = set({})   # 已经抓取的url
+        self.is_finished = False
+        self.config = Config
+        self.format_dict = {}
 
-class spider():
-    def __init__(self, depth, ):
-        self.depth = depth  # 爬取的深度,深度为1表示只爬取当前页
-        self.crawl_list = []  #待爬取列表
-        self.crawled_list = set({}) # 已经抓取的url
-        self.arrange_link_url = {}  # 获取到的url
-        self.arrange_load_url = {}  #请求资源url
-        self.depth_dict = {} #深度字典
 
-    async def visit_page(self, page, domain):
-        '''
-        访问页面并获取页面所有链接
-        '''
+    async def visit_page(self, page, url):
+        """
+        访问页面并获取当前页面所有链接
+        """
 
-        await page.goto(domain, {"waitUntil": "networkidle2"})
-        #await page.waitForNavigation()
+        await page.goto(url, {"waitUntil": "networkidle2"})
+        print('visit page:', url)
 
-        if self.depth_dict[domain] < self.depth + 1:
-            # 获取所有链接
-            link_list = await page.xpath('//a')
-            for link in link_list:
-                url = await (await link.getProperty('href')).jsonValue()
-                if url not in self.depth_dict:
-                    self.add_crawurl(domain, url)
+        link_list = await page.xpath(self.config['titleXpath'])
+        page_list = await page.xpath(self.config['pageXpath'])
 
-    def add_crawurl(self, link, url):
-        '''
-        判断链接是否抓取过和是否合法，将合法链接加入获取到的集合里
-        '''
+        await self.get_data(link_list)
+        if len(page_list) > self.config['num']:
+            page_list = random.sample(page_list, self.config['num'])
 
-        if url in self.crawled_list:
-            return
-        elif url is None or url == '':
-            return
-        if 'http' not in url:
-            return
+        for page in page_list:
+            page = await (await page.getProperty('href')).jsonValue()
+            await self.add_crawl_url(page)
 
-        # 将顶级域名提取到ext
-        #ext = tldextract.extract(url)
-        #domain = ext.subdomain + '.' + ext.domain + '.' + ext.suffix
 
-        if link not in self.arrange_link_url:
-            self.arrange_link_url[link] = {}
-        if url not in self.arrange_link_url[link]:
-            self.arrange_link_url[link][url] = []
+    async def get_data(self, links):
+        for link in links:
+            title = await (await link.getProperty('title')).jsonValue()
+            src = await (await link.getProperty('href')).jsonValue()
+            self.format_dict[title] = src
 
-        self.crawl_list.append(url)
-        self.depth_dict[url] = self.depth_dict[link] + 1
-        self.arrange_link_url[link][url].append(url)
 
-    async def get_crawurl(self,):
+    async def add_crawl_url(self, url):
+        """
+        判断链接是否抓取过和是否合法，将合法链接加入到待爬列表里
+        """
+
+        if self.can_crawl(url):
+            self.crawl_list.append(url)
+
+
+    def can_crawl(self, url):
+        if url is None or url == '':
+            return False
+        elif 'http' not in url:
+            return False
+        elif '.exe' in url:
+            return False
+        elif url in self.crawl_list:
+            return False
+        elif url not in self.crawled_list:
+            return True
+
+
+    async def get_crawl_url(self):
+        timeout_num = 1
         while True:
-            if(len(self.crawl_list) == 0):
-                time.sleep(5)
-                continue
+            if (len(self.crawl_list) == 0):
+                await asyncio.sleep(10)
+                timeout_num += 1
+                # 当列表为空时的超时次数大于20次，即200s后，就判断爬虫抓取完毕
+                if timeout_num > 20:
+                    self.is_finished = True
+                    return None
+                else:
+                    print(timeout_num)
+                    continue
 
-            #从待爬取列表中移除并获得首元素链接
+            # 从待爬取列表中移除并获得首元素链接
             url = self.crawl_list.pop(0)
-            print(url)
             self.crawled_list.add(url)
             return url
-        return None
 
-    def add_loadurl(self, pagelink, url):
 
-        if pagelink not in self.arrange_load_url:
-            self.arrange_load_url[pagelink] = {}
-        if url not in self.arrange_load_url[pagelink]:
-            self.arrange_load_url[pagelink][url] = []
+    def save_to_file(self, filename):
+        df = DataFrame(Series(self.format_dict), columns=['链接'])
+        df.index.name = '标题'
+        df.to_excel(filename + '.xlsx', sheet_name='标题列表')
 
-        self.arrange_load_url[pagelink][url].append(url)
-
-    async def inject_request(self, req):
-        '''
-        拦截请求，将发起请求的当前页面url和请求url记录下来
-        '''
-
-        self.add_loadurl(req.frame.url, req.url)
-        await req.continue_()
 
 async def main():
-    domain = 'http://www.iqiyi.com'
-    task = spider(1)
-    task.depth_dict[domain] = 0
+    Config = {
+        'start_url': 'https://movie.douban.com/top250',
+        'allow_domain': 'movie.douban.com',
+        'coroutines': 2,                          # 开启的协程数量
+        'num': 35,                                # 每个页面抓取链接数量
+        'titleXpath': '//div[@class="hd"]/a',
+        'pageXpath': '//div[@class="paginator"]/a'
+    }
 
-    browser = await launch({
+    task = Spider(Config)
+    browser = await launcher.launch({
+        'dumpio': True,
         'headless': False,
-        'args': ['--autoplay-policy=AutoplayAllowed'],
+        'ignoreHTTPSErrors': True,
+        'executablePath': 'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe'
     })
 
-    page = await browser.newPage()
-    await page.setViewport(viewport={'width': 1280, 'height': 800})
-    #await page.setUserAgent('')
+    async def worker(browser, task):
+        page = await browser.newPage()
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            '(KHTML, like Gecko) Chrome/86.0.4240.111 Safari/537.36')
 
-    #page.on('error', '''()=>{}''')
-    await page.setRequestInterception(True)
-    page.on('request', task.inject_request)
-    await task.visit_page(page, domain)
+        #删除navigator.webdriver
+        await page.evaluateOnNewDocument('''
+            () => {
+                const newProto = navigator.__proto__;
+                delete newProto.webdriver;
+                navigator.__proto__ = newProto;
+            }
+        ''')
 
-    while await task.get_crawurl():
-        await task.visit_page(page, await task.get_crawurl())
+        await task.visit_page(page, Config['start_url'])
+        while not task.is_finished:
+            try:
+                await task.visit_page(page, await task.get_crawl_url())
+            except Exception as e:
+                print('something error:', e)
+                task.save_to_file('output')
 
-    #print(task.arrange_load_url)
-    print(task.arrange_link_url)
+    async def saver():
+        while not task.is_finished:
+            await asyncio.sleep(20)
+            task.save_to_file('output')
+            print('Crawl list:', len(task.crawl_list), '\nCrawled list:', len(task.crawled_list))
 
-asyncio.get_event_loop().run_until_complete(main())
+    task_list = [asyncio.create_task(worker(browser, task)) for _ in range(Config['coroutines'])]
+    task_list.append(asyncio.create_task(saver()))
 
+    await asyncio.wait(task_list)
+    task.save_to_file('output')
+    print("finish")
 
+if __name__ == '__main__':
+    asyncio.get_event_loop().run_until_complete(main())
